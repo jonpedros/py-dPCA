@@ -797,107 +797,116 @@ class dPCA(BaseEstimator):
                     Dictionary with the scores of the shuffled data.
 
         '''
-        assert axis in [None, True]
-        
-        def compute_mean_score(X,trialX,n_splits):
-            K = 1 if axis is None else X.shape[-1]
+        explained_variance_ratio_backup = getattr(self, 'explained_variance_ratio_', None)
+        had_evr = hasattr(self, 'explained_variance_ratio_')
 
-            if type(self.n_components) == int:
-                scores = {key : np.empty((self.n_components, n_splits, K)) for key in keys}
+        try:
+            assert axis in [None, True]
+            
+            def compute_mean_score(X,trialX,n_splits):
+                K = 1 if axis is None else X.shape[-1]
+
+                if type(self.n_components) == int:
+                    scores = {key : np.empty((self.n_components, n_splits, K)) for key in keys}
+                else:
+                    scores = {key : np.empty((self.n_components[key], n_splits, K)) for key in keys}
+
+                for shuffle in range(n_splits):
+                    print('.', end=' ')
+
+                    # do train-validation split
+                    trainX, validX = self.train_test_split(X,trialX)
+
+                    # fit a dPCA model to training data & transform validation data
+                    trainZ = self.fit_transform(trainX)
+                    validZ = self.transform(validX)
+
+                    # reshape data to match Cython input
+                    for key in keys:
+                        ncomps = self.n_components if type(self.n_components) == int else self.n_components[key]
+
+                        # mean over all axis not in key
+                        axset = self.marginalizations[key]
+                        axset = axset if type(axset) == set else set.union(*axset)
+                        axes = set(range(len(X.shape)-1)) - axset
+                        for ax in list(axes)[::-1]:
+                            trainZ[key] = np.mean(trainZ[key],axis=ax+1)
+                            validZ[key] = np.mean(validZ[key],axis=ax+1)
+
+                        # reshape
+                        if len(X.shape)-2 in axset and axis is not None:
+                            trainZ[key] = trainZ[key].reshape((ncomps,-1,K))
+                            validZ[key] = validZ[key].reshape((ncomps,-1,K))
+                        else:
+                            trainZ[key] = trainZ[key].reshape((ncomps,-1,1))
+                            validZ[key] = validZ[key].reshape((ncomps,-1,1))
+
+                    # compute classification score
+                    for key in keys:
+                        ncomps = self.n_components if type(self.n_components) == int else self.n_components[key]
+                        for comp in range(ncomps):
+                            scores[key][comp, shuffle] = classification(trainZ[key][comp],validZ[key][comp])
+
+                for key in keys:
+                    scores[key] = np.nanmean(scores[key], axis=1)
+                            
+                return scores
+
+            if self.opt_regularizer_flag:
+                print("Regularization not optimized yet; start optimization now.")
+                self._optimize_regularization(X,trialX)
+
+            keys = list(self.marginalizations.keys())
+            keys.remove(self.labels[-1])
+
+            # shuffling is in-place, so we need to copy the data
+            trialX = trialX.copy()
+
+            # compute score of original data
+            print("Compute score of data: ", end=' ')
+            true_score = compute_mean_score(X,trialX,n_splits)
+            print("Finished.")
+
+            # data collection
+            scores = {key : [] for key in keys}
+
+            # iterate over shuffles
+            for it in range(n_shuffles):
+                print("\rCompute score of shuffled data: ", str(it), "/", str(n_shuffles), end=' ')
+
+                # shuffle labels
+                self.shuffle_labels(trialX)
+
+                # mean trial-by-trial data
+                X = np.nanmean(trialX,axis=0)
+
+                score = compute_mean_score(X,trialX,n_splits)
+
+                for key in keys:
+                    scores[key].append(score[key])
+
+            # binary mask, if data score is above maximum shuffled score make true
+            masks = {}
+            for key in keys:
+                maxscore = np.amax(np.dstack(scores[key]),-1)
+                masks[key] = true_score[key] > maxscore
+
+            if n_consecutive > 1:
+                for key in keys:
+                    mask = masks[key]
+
+                    for k in range(mask.shape[0]):
+                        masks[key][k,:] = denoise_mask(masks[key][k].astype(np.int32),n_consecutive)
+
+            if full:
+                return masks, true_score, scores
             else:
-                scores = {key : np.empty((self.n_components[key], n_splits, K)) for key in keys}
-
-            for shuffle in range(n_splits):
-                print('.', end=' ')
-
-                # do train-validation split
-                trainX, validX = self.train_test_split(X,trialX)
-
-                # fit a dPCA model to training data & transform validation data
-                trainZ = self.fit_transform(trainX)
-                validZ = self.transform(validX)
-
-                # reshape data to match Cython input
-                for key in keys:
-                    ncomps = self.n_components if type(self.n_components) == int else self.n_components[key]
-
-                    # mean over all axis not in key
-                    axset = self.marginalizations[key]
-                    axset = axset if type(axset) == set else set.union(*axset)
-                    axes = set(range(len(X.shape)-1)) - axset
-                    for ax in list(axes)[::-1]:
-                        trainZ[key] = np.mean(trainZ[key],axis=ax+1)
-                        validZ[key] = np.mean(validZ[key],axis=ax+1)
-
-                    # reshape
-                    if len(X.shape)-2 in axset and axis is not None:
-                        trainZ[key] = trainZ[key].reshape((ncomps,-1,K))
-                        validZ[key] = validZ[key].reshape((ncomps,-1,K))
-                    else:
-                        trainZ[key] = trainZ[key].reshape((ncomps,-1,1))
-                        validZ[key] = validZ[key].reshape((ncomps,-1,1))
-
-                # compute classification score
-                for key in keys:
-                    ncomps = self.n_components if type(self.n_components) == int else self.n_components[key]
-                    for comp in range(ncomps):
-                        scores[key][comp, shuffle] = classification(trainZ[key][comp],validZ[key][comp])
-
-            for key in keys:
-                scores[key] = np.nanmean(scores[key], axis=1)
-                        
-            return scores
-
-        if self.opt_regularizer_flag:
-            print("Regularization not optimized yet; start optimization now.")
-            self._optimize_regularization(X,trialX)
-
-        keys = list(self.marginalizations.keys())
-        keys.remove(self.labels[-1])
-
-        # shuffling is in-place, so we need to copy the data
-        trialX = trialX.copy()
-
-        # compute score of original data
-        print("Compute score of data: ", end=' ')
-        true_score = compute_mean_score(X,trialX,n_splits)
-        print("Finished.")
-
-        # data collection
-        scores = {key : [] for key in keys}
-
-        # iterate over shuffles
-        for it in range(n_shuffles):
-            print("\rCompute score of shuffled data: ", str(it), "/", str(n_shuffles), end=' ')
-
-            # shuffle labels
-            self.shuffle_labels(trialX)
-
-            # mean trial-by-trial data
-            X = np.nanmean(trialX,axis=0)
-
-            score = compute_mean_score(X,trialX,n_splits)
-
-            for key in keys:
-                scores[key].append(score[key])
-
-        # binary mask, if data score is above maximum shuffled score make true
-        masks = {}
-        for key in keys:
-            maxscore = np.amax(np.dstack(scores[key]),-1)
-            masks[key] = true_score[key] > maxscore
-
-        if n_consecutive > 1:
-            for key in keys:
-                mask = masks[key]
-
-                for k in range(mask.shape[0]):
-                    masks[key][k,:] = denoise_mask(masks[key][k].astype(np.int32),n_consecutive)
-
-        if full:
-            return masks, true_score, scores
-        else:
-            return masks
+                return masks
+        finally:
+            if had_evr:
+                self.explained_variance_ratio_ = explained_variance_ratio_backup
+            elif hasattr(self, 'explained_variance_ratio_'):
+                del self.explained_variance_ratio_
 
     def transform(self, X, marginalization=None):
         """Apply the dimensionality reduction on X.
@@ -930,8 +939,9 @@ class dPCA(BaseEstimator):
             ''' Computes the relative variance explained of each component
                 within a marginalization
             '''
-            D, Xr = self.D[marginal], X.reshape((X.shape[0],-1))
-            return [np.sum(np.dot(D[:,k], Xr)**2) / total_variance for k in range(D.shape[1])]
+            D, P, Xr = self.D[marginal], self.P[marginal], X.reshape((X.shape[0],-1))
+
+            return [np.sum(np.outer(P[:,k], np.dot(D[:,k], Xr))**2) / total_variance for k in range(D.shape[1])]
 
         if marginalization is not None:
             D, Xr         = self.D[marginalization], X.reshape((X.shape[0],-1))
