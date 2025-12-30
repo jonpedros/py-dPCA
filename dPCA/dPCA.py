@@ -465,11 +465,16 @@ class dPCA(BaseEstimator):
             else:
                 U,s,V = randomized_svd(np.dot(C,rX),n_components=self.n_components,n_iter=self.n_iter,random_state=np.random.randint(10e5))
 
+            # flip axes such that all encoders have more positive values
+            for i in range(U.shape[1]):
+                if np.sum(np.sign(U[:,i])) < 0:
+                    U[:,i] *= -1
+
             P[key] = U
             D[key] = np.dot(U.T,C).T
 
         return P, D
-
+    
     def _add_regularization(self,Y,mYs,lam,SVD=None,pre_reg=False):
         """ Prepares the data matrix and its marginalizations for the randomized_dpca solver (see paper)."""
         n_features = Y.shape[0]
