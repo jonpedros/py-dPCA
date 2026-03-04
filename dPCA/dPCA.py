@@ -12,7 +12,7 @@ from scipy.linalg import pinv
 
 from sklearn.base import BaseEstimator
 import numexpr as ne
-from utils import shuffle2D, denoise_mask, get_noise_covariance, nearest_centroid_accuracy
+from .utils import shuffle2D, denoise_mask, get_noise_covariance, nearest_centroid_accuracy
 
 class dPCA(BaseEstimator):
     """ demixed Principal component analysis (dPCA)
@@ -179,7 +179,10 @@ class dPCA(BaseEstimator):
         # ----------------------------------------------------------------------
         if trialX is not None:
             # 1. Compute Noise Covariance (Analytical Approach)
-            N_samples = self._get_n_samples(trialX, protect=self.protect)
+            # FIX: Force protect=None so N_samples has full dimensionality (N, C, T) 
+            # to match X. utils.get_noise_covariance expects to average over all axes 
+            # (including Time) which requires N_samples to have those axes.
+            N_samples = self._get_n_samples(trialX, protect=None)
             self.Cnoise = get_noise_covariance(X, trialX, N_samples, 
                                              simultaneous=self.simultaneous, 
                                              type=self.noise_covariance_type)
@@ -280,8 +283,8 @@ class dPCA(BaseEstimator):
                     # Ratio of Total Signal Variance attributed to this marginalization
                     # Sum of signal variance of components in this marginalization / Total Signal Variance
                     signal_var_captured = np.sum(ratio_signal) * total_variance
-                    self.marginalization_signal_ratios_[key] = signal_var_captured / self.total_signal_var_     
-
+                    self.marginalization_signal_ratios_[key] = signal_var_captured / self.total_signal_var_
+    
     def fit_transform(self, X, trialX=None):
         """Fit the model with X and apply the dimensionality reduction on X.
 
@@ -494,74 +497,47 @@ class dPCA(BaseEstimator):
 
             self.opt_regularizer_flag = False
     
-    def crossval_score(self, lams, X, trialX, mean=True):
-        """ Calculates crossvalidation scores for a given set of regularization
-            parameters. To this end it takes one parameter off the list,
-            computes the model on a training set and then validates the
-            reconstruction performance on a validation set.
+    def crossval_score(self, lams, X, trialX, mean=False):
+        N_samples = np.sum(~np.isnan(trialX[...,0]), axis=0)
+        
+        scores = {lam: [] for lam in lams}
 
-            Parameters
-            ----------
-            lams: 1D array of floats
-                Array of regularization parameters to test.
+        for i in range(self.n_trials):
+            print('Starting trial ', i + 1, '/', self.n_trials)
 
-            X: array-like, shape (n_samples, n_features_1, n_features_2, ...)
-                Training data, where n_samples in the number of samples
-                and n_features_j is the number of the j-features (where the
-                axis correspond to different parameters).
-
-            trialX: array-like, shape (n_trials, n_samples, n_features_1, n_features_2, ...)
-                Trial-by-trial data. Shape is similar to X but with an additional axis at the beginning
-                with different trials. If different combinations of features have different number
-                of trials, then set n_samples to the maximum number of trials and fill unoccupied data
-                points with NaN.
-
-            mean: bool (default: True)
-                Set True if the crossvalidation score should be averaged over
-                all marginalizations, otherwise False.
-
-            Returns
-            -------
-            mXs : dictionary, with values corresponding to the marginalized
-                  data (and the key refers to the marginalization)
-        """
-        scores = np.zeros((self.n_trials,len(lams))) if mean else {key : np.zeros((self.n_trials,len(lams))) for key in list(self.marginalizations.keys())}
-
-        N_samples = self._get_n_samples(trialX,protect=self.protect)
-
-        for trial in range(self.n_trials):
-            print("Starting trial ", trial + 1, "/", self.n_trials)
-
-            trainX, validX = self.train_test_split(X,trialX,N_samples=N_samples)
-
+            trainX, validX = self.train_test_split(X, trialX, N_samples=N_samples)
+            
             if self.noise_covariance_type != 'none':
-                CnoiseTrain = get_noise_covariance(trainX, trialX, N_samples - 1, simultaneous=self.simultaneous, type=self.noise_covariance_type)
+                # Match N_samples dimensions to trainX for noise covariance calculation
+                N_samples_arg = N_samples.copy()
+                while N_samples_arg.ndim < trainX.ndim:
+                    N_samples_arg = N_samples_arg[..., None]
+                
+                CnoiseTrain = get_noise_covariance(trainX, trialX, N_samples_arg - 1, simultaneous=self.simultaneous, type=self.noise_covariance_type)
             else:
                 CnoiseTrain = None
 
-            trainmXs, validmXs = self._marginalize(trainX), self._marginalize(validX)
-            
-            # Select target marginals based on CV method
-            if self.cv_method == 'training':
-                target_mXs = trainmXs
-            elif self.cv_method == 'neuronwise':
-                target_mXs = validmXs
-
-            for k, lam in enumerate(lams):
+            for lam in lams:
                 self.regularizer = lam
-                self._fit(trainX,mXs=trainmXs,Cnoise=CnoiseTrain,optimize=False)
+                # optimize=False prevents infinite recursion loop
+                self._fit(trainX, trialX, Cnoise=CnoiseTrain, optimize=False)
 
+                # 1. Project to latent space (Returns Dict)
+                Z = self.transform(validX)
+                
+                # 2. Reconstruct to high-dimensional space (Returns Array)
+                X_rec = self.inverse_transform(Z)
+
+                # 3. Compute reconstruction error
                 if mean:
-                    scores[trial,k] = self._score(validX,target_mXs)
+                    scores[lam].append(np.mean((validX - X_rec)**2))
                 else:
-                    tmp = self._score(validX,target_mXs,mean=False)
-                    for key in list(self.marginalizations.keys()):
-                        scores[key][trial,k] = tmp[key]
+                    scores[lam].append(np.sum((validX - X_rec)**2))
 
         return scores    
     
     def _score(self, X, mXs, mean=True):
-        """ Scoring for crossvalidation.
+        r""" Scoring for crossvalidation.
         
             If cv_method == 'neuronwise', it predicts one observable (e.g. one neuron) of X at a time, using all other dimensions:
             \sum_phi ||X[n] - F_\phi D_phi^{-n} X^{-n}||^2
@@ -646,7 +622,7 @@ class dPCA(BaseEstimator):
 
         return P, D    
     
-    def _add_regularization(self,Y,mYs,lam,SVD=None,pre_reg=False,Cnoise=None):
+    def _add_regularization(self, Y, mYs, lam, SVD=None, pre_reg=False, Cnoise=None):
         """ Prepares the data matrix and its marginalizations for the randomized_dpca solver (see paper)."""
         n_features = Y.shape[0]
 
@@ -855,8 +831,8 @@ class dPCA(BaseEstimator):
 
         return trialX
 
-    def significance_analysis(self, X, trialX, n_shuffles=100, n_splits=100,n_consecutive=10, 
-                              n_eval_comps=3,axis=None,full=False):
+    def significance_analysis(self, X, trialX, n_shuffles=100, n_splits=100, n_consecutive=10, 
+                              n_eval_comps=3, axis=None, full=False):
         '''
             Cross-validated significance analysis of dPCA model. Here the generalization from the training
             to test data is tested by a simple classification measure in which one tries to predict the
