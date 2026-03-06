@@ -179,16 +179,12 @@ class dPCA(BaseEstimator):
         # ----------------------------------------------------------------------
         if trialX is not None:
             # 1. Compute Noise Covariance (Analytical Approach)
-            # FIX: Force protect=None so N_samples has full dimensionality (N, C, T) 
-            # to match X. utils.get_noise_covariance expects to average over all axes 
-            # (including Time) which requires N_samples to have those axes.
             N_samples = self._get_n_samples(trialX, protect=None)
             self.Cnoise = get_noise_covariance(X, trialX, N_samples, 
                                              simultaneous=self.simultaneous, 
                                              type=self.noise_covariance_type)
             
             # 2. Compute effective trials (Ktilde) per neuron for scaling
-            # N_samples shape: (n_features, ...conditions...) -> (n_features, -1) -> mean(axis=1)
             Ktilde = np.mean(N_samples.reshape(N_samples.shape[0], -1), axis=1)
             
             # 3. Total Statistics
@@ -234,6 +230,10 @@ class dPCA(BaseEstimator):
         # Compute Explained Variance
         # ------------------------------------------------------------------
         total_variance = np.sum(X**2)
+        # Prevent division-by-zero warnings when computing explained variance of flat shuffled data
+        if total_variance == 0:
+            total_variance = 1e-10
+
         X_flat = X.reshape((X.shape[0], -1))
 
         def marginal_variances(marginal):
@@ -253,8 +253,6 @@ class dPCA(BaseEstimator):
         # ------------------------------------------------------------------
         
         # 1. PCA Explained Variance
-        # Compute SVD of X to get optimal PCA variance
-        # X_flat is (n_features, n_samples)
         U, s, Vh = np.linalg.svd(X_flat, full_matrices=False)
         self.explained_variance_ratio_pca_ = s**2 / total_variance
 
@@ -268,7 +266,6 @@ class dPCA(BaseEstimator):
                 if key in self.D:
                     D = self.D[key]
                     # Projected Noise Variance: diag(D^T * Cnoise_mean * D)
-                    # We normalize by Total Data Variance to keep units consistent with explained_variance_ratio_
                     noise_vars_projected = np.diag(np.dot(D.T, np.dot(self.Cnoise_mean_, D)))
                     
                     ratio_noise = noise_vars_projected / total_variance
@@ -281,10 +278,11 @@ class dPCA(BaseEstimator):
                     self.explained_variance_ratio_signal_[key] = ratio_signal
                     
                     # Ratio of Total Signal Variance attributed to this marginalization
-                    # Sum of signal variance of components in this marginalization / Total Signal Variance
                     signal_var_captured = np.sum(ratio_signal) * total_variance
-                    self.marginalization_signal_ratios_[key] = signal_var_captured / self.total_signal_var_
-    
+                    # Prevent division by zero if total signal variance is exactly 0
+                    safe_total_signal = self.total_signal_var_ if self.total_signal_var_ != 0 else 1e-10
+                    self.marginalization_signal_ratios_[key] = signal_var_captured / safe_total_signal
+
     def fit_transform(self, X, trialX=None):
         """Fit the model with X and apply the dimensionality reduction on X.
 
@@ -578,7 +576,8 @@ class dPCA(BaseEstimator):
             to low-dimensional space).
 
         """
-        from scipy.sparse.linalg import eigsh
+        from scipy.sparse.linalg import eigsh, ArpackError
+        from scipy.linalg import eigh
 
         n_features = X.shape[0]
         rX = X.reshape((n_features,-1))
@@ -600,11 +599,19 @@ class dPCA(BaseEstimator):
                 n_comp = self.n_components
 
             # Extract exact top n_comp eigenvectors
-            evals, evecs = eigsh(MMT, k=n_comp, which='LM')
-            
-            # eigsh returns eigenvalues in ascending order, reverse to match descending variance
-            idx = np.argsort(evals)[::-1]
-            U = evecs[:, idx]
+            # ARPACK eigsh fails (Error -9) if MMT is identically zero, which can happen 
+            # during shuffling. We use a fallback to standard eigh in these cases.
+            try:
+                if np.max(np.abs(MMT)) < 1e-13:
+                    raise ArpackError(-9, "Matrix is too close to zero")
+                evals, evecs = eigsh(MMT, k=n_comp, which='LM')
+                # eigsh returns eigenvalues in ascending order, reverse to match descending variance
+                idx = np.argsort(evals)[::-1]
+                U = evecs[:, idx]
+            except Exception: # Catch ArpackError or related sparse exceptions
+                evals, evecs = eigh(MMT)
+                idx = np.argsort(evals)[::-1][:n_comp]
+                U = evecs[:, idx]
 
             # flip axes such that all encoders have more positive values
             for i in range(U.shape[1]):
@@ -617,8 +624,11 @@ class dPCA(BaseEstimator):
             if self.scale:
                 for i in range(D[key].shape[1]):
                     B = np.outer(P[key][:, i], np.dot(D[key][:, i].T, rX))
-                    scaling_factor = np.sum(mX * B) / np.sum(B * B)
-                    D[key][:, i] *= scaling_factor
+                    # Prevent division by zero if B is completely zero
+                    b_norm = np.sum(B * B)
+                    if b_norm > 1e-13:
+                        scaling_factor = np.sum(mX * B) / b_norm
+                        D[key][:, i] *= scaling_factor
 
         return P, D    
     
@@ -649,7 +659,10 @@ class dPCA(BaseEstimator):
             covariance_term = np.dot(Y.reshape((n_features,-1)),Y.reshape((n_features,-1)).T) + lam**2*np.eye(n_features)
             if Cnoise is not None:
                 covariance_term += Cnoise
-            pregY = np.dot(regY.reshape((n_features,-1)).T,np.linalg.inv(covariance_term))
+            
+            # FIX: Use pinv (pseudo-inverse) instead of np.linalg.inv to avoid Singular Matrix 
+            # errors when n_features > n_samples during cross-validation/shuffling
+            pregY = np.dot(regY.reshape((n_features,-1)).T, pinv(covariance_term))
 
         return regY, regmYs, pregY
        
@@ -832,7 +845,7 @@ class dPCA(BaseEstimator):
         return trialX
 
     def significance_analysis(self, X, trialX, n_shuffles=100, n_splits=100, n_consecutive=10, 
-                              n_eval_comps=3, axis=None, full=False):
+                              n_eval_comps=3, axis=None, full=False, n_jobs=-1):
         '''
             Cross-validated significance analysis of dPCA model. Here the generalization from the training
             to test data is tested by a simple classification measure in which one tries to predict the
@@ -866,8 +879,10 @@ class dPCA(BaseEstimator):
                     Sometimes individual data points are deemed significant purely by chance. To reduced
                     such noise one can demand that at least n consecutive data points are rated as significant.
 
-                n_eval_comps: integer
+                n_eval_comps: integer or dictionary
                     Number of components to evaluate for classification accuracy (default = 3).
+                    If a dictionary, it maps marginalization keys to the number of components 
+                    to evaluate for that specific marginalization.
                     
                 axis: None or True (default = None)
                     Determines whether the significance is calculated over the last axis. More precisely,
@@ -877,6 +892,9 @@ class dPCA(BaseEstimator):
                 full: Boolean (default = False)
                     Whether or not all scores are returned. If False, only the significance matrix is returned.
 
+                n_jobs: integer (default = -1)
+                    The number of CPU cores to use for parallelizing the shuffling permutations. 
+                    -1 uses all available cores.
 
             Returns
             -------
@@ -891,6 +909,8 @@ class dPCA(BaseEstimator):
                     Dictionary with the scores of the shuffled data.
 
         '''
+        from joblib import Parallel, delayed
+
         explained_variance_ratio_backup = getattr(self, 'explained_variance_ratio_', None)
         had_evr = hasattr(self, 'explained_variance_ratio_')
 
@@ -915,17 +935,21 @@ class dPCA(BaseEstimator):
             if self.labels[-1] in keys:
                 keys.remove(self.labels[-1])
             
-            def compute_mean_score(X,trialX,n_splits):
+            def compute_mean_score(X,trialX,n_splits, verbose=True):
                 K = 1 if axis is None else X.shape[-1]
                 data_ndim = len(X.shape) - 1
 
-                if type(self.n_components) == int:
-                    scores = {key : np.empty((min(n_eval_comps, self.n_components), n_splits, K)) for key in keys}
-                else:
-                    scores = {key : np.empty((min(n_eval_comps, self.n_components[key]), n_splits, K)) for key in keys}
+                def get_ncomps_eval(key):
+                    ncomps = self.n_components if type(self.n_components) == int else self.n_components[key]
+                    if isinstance(n_eval_comps, dict):
+                        return min(n_eval_comps.get(key, 0), ncomps)
+                    return min(n_eval_comps, ncomps)
+
+                scores = {key : np.empty((get_ncomps_eval(key), n_splits, K)) for key in keys}
 
                 for shuffle in range(n_splits):
-                    print('.', end=' ')
+                    if verbose:
+                        print('.', end=' ')
 
                     trainX, validX = self.train_test_split(X,trialX)
 
@@ -933,8 +957,9 @@ class dPCA(BaseEstimator):
                     validZ = self.transform(validX)
 
                     for key in keys:
-                        ncomps = self.n_components if type(self.n_components) == int else self.n_components[key]
-                        ncomps_eval = min(n_eval_comps, ncomps)
+                        ncomps_eval = get_ncomps_eval(key)
+                        if ncomps_eval == 0:
+                            continue
 
                         dots = np.dot(full_D[key].T, self.D[key])
                         aligned_trainZ = np.zeros_like(trainZ[key])
@@ -951,7 +976,7 @@ class dPCA(BaseEstimator):
                         axset = self.marginalizations[key]
                         axset = axset if type(axset) == set else set.union(*axset)
                         
-                        key_axes = list(axset)
+                        key_axes = [ax for ax in list(axset) if (axis is None or ax != data_ndim - 1)]
                         non_key_axes = [ax for ax in range(data_ndim - (1 if axis is not None else 0)) if ax not in key_axes]
                         time_axis = [data_ndim - 1] if axis is not None else []
                         
@@ -976,7 +1001,10 @@ class dPCA(BaseEstimator):
                             scores[key][comp, shuffle] = accuracy
 
                 for key in keys:
-                    scores[key] = np.nanmean(scores[key], axis=1)
+                    if scores[key].shape[0] > 0:
+                        scores[key] = np.nanmean(scores[key], axis=1)
+                    else:
+                        scores[key] = np.empty((0, K))
                             
                 return scores
 
@@ -988,22 +1016,29 @@ class dPCA(BaseEstimator):
 
             scores = {key : [] for key in keys}
 
-            for it in range(n_shuffles):
-                print("\rCompute score of shuffled data: ", str(it), "/", str(n_shuffles), end=' ')
+            def parallel_shuffle_iteration(it_idx):
+                shuffled_trialX = trialX.copy()
+                self.shuffle_labels(shuffled_trialX)
+                X_shuffled = np.nanmean(shuffled_trialX, axis=0)
+                return compute_mean_score(X_shuffled, shuffled_trialX, n_splits, verbose=False)
 
-                self.shuffle_labels(trialX)
+            print(f"Computing score of shuffled data ({n_shuffles} iterations) across {n_jobs if n_jobs > 0 else 'all available'} cores...")
+            
+            parallel_results = Parallel(n_jobs=n_jobs)(
+                delayed(parallel_shuffle_iteration)(i) for i in range(n_shuffles)
+            )
 
-                X_shuffled = np.nanmean(trialX,axis=0)
-
-                score = compute_mean_score(X_shuffled,trialX,n_splits)
-
+            for score in parallel_results:
                 for key in keys:
                     scores[key].append(score[key])
 
             masks = {}
             for key in keys:
-                maxscore = np.amax(np.dstack(scores[key]),-1)
-                masks[key] = true_score[key] > maxscore
+                if true_score[key].shape[0] > 0:
+                    maxscore = np.amax(np.dstack(scores[key]),-1)
+                    masks[key] = true_score[key] > maxscore
+                else:
+                    masks[key] = np.empty_like(true_score[key], dtype=bool)
 
             if n_consecutive > 1:
                 for key in keys:
@@ -1027,8 +1062,8 @@ class dPCA(BaseEstimator):
             if full_P is not None:
                 self.P = full_P
             if full_regularizer is not None:
-                self.regularizer = full_regularizer    
-    
+                self.regularizer = full_regularizer
+
     def transform(self, X, marginalization=None):
         """Apply the dimensionality reduction on X.
 
